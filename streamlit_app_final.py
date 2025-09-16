@@ -14,7 +14,7 @@ import requests
 st.set_page_config(page_title="GaushalaNet — Local", layout="wide")
 
 # ---------------- CONFIG ----------------
-DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details
+DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details (matches your uploaded file)
 MODEL_PATH = "cow_model.h5"                   # Local fallback model
 CLASS_INDICES_PATH = "class_indices.json"     # optional mapping saved at training
 TRAIN_DIR = "cow_nose_dataset/training_data"  # optional fallback
@@ -104,12 +104,14 @@ def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
             return {}, f"failed_json:{e}"
 
     if df is not None and not df.empty:
-        if "name" in [c.lower() for c in df.columns]:
-            names = df["name"].astype(str).tolist()
+        # prefer 'name' or 'id' columns (case-insensitive)
+        cols_lower = [c.lower() for c in df.columns]
+        if "name" in cols_lower:
+            names = df[df.columns[cols_lower.index("name")]].astype(str).tolist()
             inv = {i: n for i, n in enumerate(names)}
             return inv, "loaded_excel_name_order"
-        if "id" in [c.lower() for c in df.columns]:
-            ids = df["id"].astype(str).tolist()
+        if "id" in cols_lower:
+            ids = df[df.columns[cols_lower.index("id")]].astype(str).tolist()
             inv = {i: n for i, n in enumerate(ids)}
             return inv, "loaded_excel_id_order"
 
@@ -243,23 +245,16 @@ elif page == "Predict (Image)":
             if st.button("Predict"):
                 try:
                     idx, conf = predict_index(model, pil_image)
-                    st.write(f"Raw predicted index: {idx}, confidence: {conf}")
-                    mapped_name = None
-                    if inv_class_indices and idx is not None:
-                        mapped_name = inv_class_indices.get(idx)
-                    if mapped_name is None and labels and idx is not None and 0 <= idx < len(labels):
-                        mapped_name = labels[idx]
-                    if mapped_name:
-                        st.success(f"Predicted Cow: **{mapped_name}** ({conf * 100:.2f}% confidence)")
-                        profile = pd.DataFrame()
-                        if "name" in df.columns:
-                            profile = df[df["name"].astype(str).str.strip().str.lower() == mapped_name.strip().lower()]
-                        if not profile.empty:
-                            st.subheader("Cow Profile")
-                            st.table(profile.head(1).T)
+                    # Map index -> name using Excel order (row order)
+                    if idx is not None and not df.empty and "name" in df.columns:
+                        if 0 <= idx < len(df):
+                            cow_name = str(df.iloc[idx]["name"])
+                            # Show only the name as requested
+                            st.success(f"🐄 Predicted Cow: **{cow_name}**")
+                        else:
+                            st.error("Prediction index out of range for dataset.")
                     else:
-                        st.warning("Could not map prediction to a cow name. Check mapping source or provide class_indices.json.")
-                        st.info(f"Mapping source: {map_source}, inv_class_indices entries: {list(inv_class_indices.items())[:10]}")
+                        st.error("Could not map prediction to a cow name — ensure the Excel has a 'name' column and matches training order.")
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
 
