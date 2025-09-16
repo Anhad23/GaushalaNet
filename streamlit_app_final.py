@@ -1,37 +1,36 @@
-# streamlit_app_final.py
-import os
-import re
-import io
-import traceback
-from pathlib import Path
-
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from PIL import Image
+import matplotlib.pyplot as plt
+from datetime import datetime
+from PIL import Image, ImageOps
+import io
+import os
+import json
+import re
 import requests
 
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import img_to_array
+st.set_page_config(page_title="GaushalaNet — Local", layout="wide")
 
-# -------------------------
-# Config (edit if needed)
-# -------------------------
-IMG_SIZE = (224, 224)                          # change if your model expects different size
-LOCAL_MODEL_PATH = "models/cow_model.h5"
-# Use the exact filename you have in the repo (keeps compatibility)
-DATA_FILENAME = "Facila Recongnition Data.xlsx"  # <-- matches your uploaded file
-# Candidate columns in your Excel - code will try these automatically
-PREFERRED_LABEL_COLS = ["Label", "label", "class", "Class", "index"]
-PREFERRED_NAME_COLS = ["Name", "name", "CowName", "cow_name", "Cow", "cow"]
-PREFERRED_ID_COLS = ["ID", "id", "CowID", "cow_id"]
-PREFERRED_GENDER_COLS = ["Gender", "gender", "Sex", "sex"]
-OTHER_INFO_COLS = []  # add more known column names if desired
+# ---------------- CONFIG ----------------
+DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details
+MODEL_PATH = "cow_model.h5"                   # Local fallback model
+CLASS_INDICES_PATH = "class_indices.json"     # optional mapping saved at training
+TRAIN_DIR = "cow_nose_dataset/training_data"  # optional fallback
+IMAGE_SIZE = (224, 224)                       # adjust if needed
 
-# -------------------------
-# Helpers: Google Drive-safe downloader
-# -------------------------
-def _extract_gdrive_id(url_or_id: str) -> str:
+# ---------------- HELPERS ----------------
+@st.cache_data(ttl=600)
+def load_data(path=DATA_PATH):
+    try:
+        df = pd.read_excel(path)
+        return df
+    except Exception as e:
+        st.warning(f"Could not read Excel file at {path}: {e}")
+        return pd.DataFrame()
+
+def _extract_gdrive_id(url_or_id: str):
     m = re.search(r"/d/([a-zA-Z0-9_-]+)", str(url_or_id))
     if m:
         return m.group(1)
@@ -40,7 +39,7 @@ def _extract_gdrive_id(url_or_id: str) -> str:
         return m.group(1)
     return str(url_or_id)
 
-def download_file_from_gdrive(url_or_id: str, out_path: str, chunk_size: int = 32768):
+def download_model_from_gdrive(url_or_id: str, out_path: str, chunk_size: int = 32768):
     file_id = _extract_gdrive_id(url_or_id)
     session = requests.Session()
     URL = "https://docs.google.com/uc?export=download"
@@ -67,261 +66,269 @@ def download_file_from_gdrive(url_or_id: str, out_path: str, chunk_size: int = 3
                 f.write(chunk)
     return out_path
 
-def download_file_generic(url: str, out_path: str, chunk_size: int = 8192):
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
-    return out_path
-
-def download_file(url_or_id: str, out_path: str):
-    if "drive.google.com" in str(url_or_id) or re.match(r"^[a-zA-Z0-9_-]{10,}$", str(url_or_id)):
-        return download_file_from_gdrive(url_or_id, out_path)
-    return download_file_generic(url_or_id, out_path)
-
-# -------------------------
-# Preprocessing
-# -------------------------
-def pil_to_numpy(img: Image.Image, target_size=IMG_SIZE):
-    img = img.convert("RGB")
-    img = img.resize(target_size)
-    arr = img_to_array(img).astype("float32") / 255.0
-    return np.expand_dims(arr, axis=0)
-
-# -------------------------
-# Cached resources
-# -------------------------
-@st.cache_data(ttl=3600)
-def load_excel_data(path: str):
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_excel(path, engine="openpyxl")
-        # reset index to ensure predictable iloc mapping
-        df = df.reset_index(drop=True)
-        return df
-    except Exception:
-        # if read_excel fails, return None and print trace in main flow
-        return None
-
 @st.cache_resource
-def get_model_from_url(model_url: str, local_path: str):
-    if not os.path.exists(local_path):
-        download_file(model_url, local_path)
-    model = load_model(local_path, compile=False)
-    return model
-
-# -------------------------
-# Startup & diagnostics
-# -------------------------
-st.set_page_config(page_title="GaushalaNet", layout="wide")
-st.title("🐄 GaushalaNet — Cattle ID Demo")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-Path("models").mkdir(parents=True, exist_ok=True)
-DATA_PATH = os.path.join(BASE_DIR, DATA_FILENAME)
-MODEL_PATH = os.path.join(BASE_DIR, LOCAL_MODEL_PATH)
-
-st.sidebar.markdown("### Environment")
-st.sidebar.write("cwd:", os.getcwd())
-st.sidebar.write("base_dir:", BASE_DIR)
-st.sidebar.write("files:", sorted(os.listdir(BASE_DIR)))
-st.sidebar.markdown("### Paths")
-st.sidebar.write("DATA_PATH:", DATA_PATH)
-st.sidebar.write("MODEL_PATH:", MODEL_PATH)
-st.sidebar.write("Exists DATA:", os.path.exists(DATA_PATH))
-st.sidebar.write("Exists MODEL:", os.path.exists(MODEL_PATH))
-
-# Load Excel
-df_cow = None
-try:
-    df_cow = load_excel_data(DATA_PATH)
-    if df_cow is not None:
-        st.sidebar.success("Excel data loaded")
-    else:
-        st.sidebar.warning("Excel file not found or unreadable — predictions won't map to cow info.")
-except Exception as e:
-    st.sidebar.error(f"Excel load error: {e}")
-    st.sidebar.text(traceback.format_exc())
-    df_cow = None
-
-# Load model
-model = None
-MODEL_URL = None
-try:
-    # reading secrets; safe even if not present
-    MODEL_URL = st.secrets.get("MODEL_URL", None)
-except Exception:
-    MODEL_URL = None
-
-if os.path.exists(MODEL_PATH):
-    try:
-        model = load_model(MODEL_PATH, compile=False)
-        st.sidebar.success("Model loaded from repo file")
-    except Exception as e:
-        st.sidebar.error(f"Failed to load local model: {e}")
-        st.sidebar.text(traceback.format_exc())
-
-if model is None and MODEL_URL:
-    try:
-        with st.spinner("Downloading & loading model (first run)..."):
-            model = get_model_from_url(MODEL_URL, MODEL_PATH)
-        st.sidebar.success("Model downloaded & loaded")
-    except Exception as e:
-        st.sidebar.error(f"Model download/load failed: {e}")
-        st.sidebar.text(traceback.format_exc())
-
-if model is None:
-    st.warning("No model loaded. Set MODEL_URL in Streamlit secrets or place cow_model.h5 in models/")
-
-# -------------------------
-# Helper: best-effort column discovery
-# -------------------------
-def find_column(df, candidates):
-    if df is None:
-        return None
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-# -------------------------
-# UI: image upload / sample
-# -------------------------
-st.markdown("## 📷 Predict cattle from an image")
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    uploaded = st.file_uploader("Upload image (png/jpg/jpeg)", type=["png", "jpg", "jpeg"])
-    sample_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-    sample_choice = None
-    if sample_files:
-        sample_choice = st.selectbox("Or choose a sample image from repo", ["-- none --"] + sample_files)
-
-    run_btn = st.button("Run prediction")
-
-with col2:
-    image = None
-    if uploaded:
+def try_load_model(model_path=MODEL_PATH):
+    import tensorflow as tf
+    # If MODEL_URL secret exists, prefer that
+    MODEL_URL = st.secrets.get("MODEL_URL", None) if "MODEL_URL" in st.secrets else None
+    if MODEL_URL and not os.path.exists(model_path):
         try:
-            image = Image.open(io.BytesIO(uploaded.read()))
-            st.image(image, caption="Uploaded image", use_container_width=True)
+            st.sidebar.info("Downloading model from secrets URL...")
+            download_model_from_gdrive(MODEL_URL, model_path)
         except Exception as e:
-            st.error(f"Cannot open uploaded image: {e}")
-    elif sample_choice and sample_choice != "-- none --":
+            return None, f"Download failed: {e}"
+
+    try:
+        model = tf.keras.models.load_model(model_path)
+        return model, None
+    except Exception as e:
+        return None, str(e)
+
+@st.cache_data
+def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
+    """
+    Returns inv_class_indices: dict mapping index -> folder/name used in training.
+    Priority:
+      1) class_indices.json
+      2) Excel df with 'name' or 'id' column
+      3) Training folder names
+    """
+    inv = {}
+    if os.path.exists(path):
         try:
-            image = Image.open(os.path.join(BASE_DIR, sample_choice))
-            st.image(image, caption=f"Sample: {sample_choice}", use_container_width=True)
+            with open(path, "r") as f:
+                class_idx = json.load(f)
+            inv = {int(v): k for k, v in class_idx.items()}
+            return inv, "loaded_json"
         except Exception as e:
-            st.error(f"Cannot open sample image: {e}")
-    else:
-        st.info("Upload or select an image to run prediction.")
+            return {}, f"failed_json:{e}"
 
-# -------------------------
-# Prediction & mapping
-# -------------------------
-def map_prediction_to_row(df, top_idx):
-    """
-    Try to map predicted top_idx to a row:
-    1. If a numeric label column exists, match on that.
-    2. Else fallback to iloc[top_idx] if in range.
-    Returns dict row or None.
-    """
-    if df is None:
-        return None
+    if df is not None and not df.empty:
+        if "name" in [c.lower() for c in df.columns]:
+            names = df["name"].astype(str).tolist()
+            inv = {i: n for i, n in enumerate(names)}
+            return inv, "loaded_excel_name_order"
+        if "id" in [c.lower() for c in df.columns]:
+            ids = df["id"].astype(str).tolist()
+            inv = {i: n for i, n in enumerate(ids)}
+            return inv, "loaded_excel_id_order"
 
-    label_col = find_column(df, PREFERRED_LABEL_COLS)
-    if label_col is not None:
-        # attempt numeric match
+    if os.path.exists(train_dir):
+        folders = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+        inv = {i: name for i, name in enumerate(folders)}
+        return inv, "loaded_train_dir"
+
+    return {}, "no_mapping_found"
+
+def get_resample_filter():
+    try:
+        return Image.Resampling.LANCZOS   # Pillow >=10
+    except AttributeError:
         try:
-            # Try matching integer label
-            match = df[df[label_col].astype(str).str.strip() == str(top_idx)]
-            if not match.empty:
-                return match.iloc[0].to_dict()
+            return Image.LANCZOS
+        except AttributeError:
+            return Image.BICUBIC
+
+def preprocess_image(image: Image.Image, target_size=IMAGE_SIZE):
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    resample = get_resample_filter()
+    image = ImageOps.fit(image, target_size, method=resample)
+    arr = np.array(image).astype(np.float32) / 255.0
+    return arr
+
+def predict_index(model, pil_image: Image.Image):
+    x = preprocess_image(pil_image)
+    x = np.expand_dims(x, axis=0)
+    preds = model.predict(x)
+    if preds.ndim == 2 and preds.shape[1] > 1:
+        idx = int(np.argmax(preds[0]))
+        conf = float(np.max(preds[0]))
+        return idx, conf
+    else:
+        return None, None
+
+def compute_health_score(row):
+    score = 80
+    if "health_status" in row and isinstance(row["health_status"], str):
+        if "sick" in row["health_status"].lower():
+            score -= 40
+    if "age" in row and pd.notna(row["age"]):
+        try:
+            if float(row["age"]) > 10:
+                score -= 10
         except Exception:
             pass
-        # try numeric cast
-        try:
-            match = df[df[label_col].astype(float) == float(top_idx)]
-            if not match.empty:
-                return match.iloc[0].to_dict()
-        except Exception:
-            pass
+    if "last_checkup" in row and pd.isna(row["last_checkup"]):
+        score -= 10
+    return max(0, min(100, score))
 
-    # fallback: positional mapping
-    if 0 <= top_idx < len(df):
-        return df.iloc[top_idx].to_dict()
+# ---------------- LOAD DATA & MODEL ----------------
+df = load_data()
+if not df.empty:
+    cols_lower = [c.lower() for c in df.columns]
+    rename_map = {}
+    if "cow_id" in cols_lower and "id" not in cols_lower:
+        rename_map[df.columns[cols_lower.index("cow_id")]] = "id"
+    if "cow_name" in cols_lower and "name" not in cols_lower:
+        rename_map[df.columns[cols_lower.index("cow_name")]] = "name"
+    for alt in ["Name", "names", "NAME", "CowName", "cow_name"]:
+        if alt in df.columns and "name" not in rename_map.values():
+            rename_map[alt] = "name"
+            break
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
-    return None
+    for c in df.columns:
+        if any(x in c.lower() for x in ["date", "dob", "checkup", "vacc"]):
+            try:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+            except Exception:
+                pass
+    if "age" not in df.columns and "dob" in df.columns:
+        df["age"] = ((pd.Timestamp.now() - df["dob"]).dt.days / 365).round(1)
+    if "health_score" not in df.columns:
+        df["health_score"] = df.apply(compute_health_score, axis=1)
 
-def predict_and_display(img: Image.Image):
+model, model_err = try_load_model(MODEL_PATH)
+inv_class_indices, map_source = load_class_indices(CLASS_INDICES_PATH, TRAIN_DIR, df)
+st.sidebar.write(f"Mapping source: {map_source}")
+
+labels = None
+if inv_class_indices:
+    max_idx = max(inv_class_indices.keys())
+    labels = [inv_class_indices.get(i, "") for i in range(max_idx + 1)]
+elif not df.empty and "name" in df.columns:
+    labels = df["name"].astype(str).tolist()
+
+# ---------------- SIDEBAR ----------------
+st.sidebar.title("GaushalaNet — Control")
+page = st.sidebar.radio("Navigation",
+                       ["Home", "Predict (Image)", "Health Tracker", "Cow Profiles", "E-Learning", "Upload Data", "About"])
+
+# ---------------- PAGES ----------------
+if page == "Home":
+    st.title("GaushalaNet — Smart Gaushala Dashboard")
+    c1, c2, c3, c4 = st.columns(4)
+    total = len(df) if not df.empty else 0
+    at_risk = int((df["health_score"] < 50).sum()) if ("health_score" in df.columns) else 0
+    vacc_due = int(df["vaccination_due"].notna().sum()) if "vaccination_due" in df.columns else 0
+    avg_h = round(df["health_score"].mean(), 1) if ("health_score" in df.columns) else 0
+    c1.metric("Total cows", total)
+    c2.metric("At-risk (score<50)", at_risk)
+    c3.metric("Vaccination records", vacc_due)
+    c4.metric("Avg health score", avg_h)
+
+    st.markdown("### Health score distribution")
+    if not df.empty and "health_score" in df.columns:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.hist(df["health_score"].dropna(), bins=10)
+        ax.set_xlabel("Health score")
+        ax.set_ylabel("Count")
+        st.pyplot(fig)
+    else:
+        st.info("No dataset loaded. Upload data on Upload Data page.")
+
+elif page == "Predict (Image)":
+    st.title("Identify Cow from Image")
+    uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+    if uploaded_file is not None:
+        pil_image = Image.open(io.BytesIO(uploaded_file.read()))
+        st.image(pil_image, caption="Uploaded image", use_container_width=True)
+        if model is None:
+            st.error("No model loaded.")
+            if model_err:
+                st.code(model_err)
+        else:
+            if st.button("Predict"):
+                try:
+                    idx, conf = predict_index(model, pil_image)
+                    st.write(f"Raw predicted index: {idx}, confidence: {conf}")
+                    mapped_name = None
+                    if inv_class_indices and idx is not None:
+                        mapped_name = inv_class_indices.get(idx)
+                    if mapped_name is None and labels and idx is not None and 0 <= idx < len(labels):
+                        mapped_name = labels[idx]
+                    if mapped_name:
+                        st.success(f"Predicted Cow: **{mapped_name}** ({conf * 100:.2f}% confidence)")
+                        profile = pd.DataFrame()
+                        if "name" in df.columns:
+                            profile = df[df["name"].astype(str).str.strip().str.lower() == mapped_name.strip().lower()]
+                        if not profile.empty:
+                            st.subheader("Cow Profile")
+                            st.table(profile.head(1).T)
+                    else:
+                        st.warning("Could not map prediction to a cow name. Check mapping source or provide class_indices.json.")
+                        st.info(f"Mapping source: {map_source}, inv_class_indices entries: {list(inv_class_indices.items())[:10]}")
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
+
+elif page == "Health Tracker":
+    st.title("Health Tracker — Alerts & Management")
+    if df.empty:
+        st.info("No dataset available.")
+    else:
+        st.markdown("#### Vaccinations due in next 30 days")
+        if "vaccination_due" in df.columns:
+            today = pd.Timestamp.now().normalize()
+            vacc_dates = pd.to_datetime(df["vaccination_due"], errors="coerce")
+            due = df[(vacc_dates - today).dt.days.between(0, 30)]
+            if not due.empty:
+                st.warning(f"{len(due)} animals have vaccination due soon")
+                st.dataframe(due[["id", "name", "breed", "vaccination_due"]])
+            else:
+                st.success("No vaccinations due in next 30 days.")
+        st.markdown("#### Low health score animals (score < 50)")
+        low = df[df["health_score"] < 50] if "health_score" in df.columns else pd.DataFrame()
+        if not low.empty:
+            st.dataframe(low[["id", "name", "breed", "age", "health_score", "health_status"]].head(50))
+        else:
+            st.success("No animals below health threshold.")
+
+elif page == "Cow Profiles":
+    st.title("Cow Profiles")
+    if df.empty:
+        st.info("No dataset available.")
+    else:
+        search = st.text_input("Search by ID or name")
+        subset = df.copy()
+        if search:
+            mask = subset.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False)).any(axis=1)
+            subset = subset[mask]
+        st.dataframe(subset.head(100))
+
+elif page == "E-Learning":
+    st.title("E-Learning — Knowledge Hub")
+    st.subheader("Feeding best practices")
+    st.write("- Keep feeding times consistent\n- Provide clean water\n- Balance nutrition")
+    st.subheader("Vaccination schedule")
+    st.write("- Keep a vaccination calendar\n- Record boosters and doses\n- Consult vet for regional disease risks")
+    st.markdown("---")
+    st.subheader("Quick quiz")
+    q1 = st.radio("How often review vaccination schedules?", ["Monthly", "Annually", "Only when sick"])
+    q2 = st.radio("Is decreased appetite an early sign of illness?", ["Yes", "No"])
+    if st.button("Submit Quiz"):
+        score = 0
+        if q1 == "Monthly":
+            score += 1
+        if q2 == "Yes":
+            score += 1
+        st.success(f"Score: {score}/2")
+
+elif page == "Upload Data":
+    st.title("Upload dataset (Excel)")
+    uploaded = st.file_uploader("Upload Excel file (.xls/.xlsx)", type=["xls", "xlsx"])
+    if uploaded is not None:
+        new_df = pd.read_excel(uploaded)
+        st.dataframe(new_df.head())
+        if st.button("Save uploaded dataset"):
+            new_df.to_excel(DATA_PATH, index=False)
+            st.success("Saved dataset. Restart app to load new data.")
+
+else:
+    st.title("About")
+    st.write("GaushalaNet — Local-only demo")
     if model is None:
-        st.error("Model not available.")
-        return
-
-    x = pil_to_numpy(img, target_size=IMG_SIZE)
-    try:
-        preds = model.predict(x)
-    except Exception as e:
-        st.error(f"Model prediction error: {e}")
-        st.text(traceback.format_exc())
-        return
-
-    # handle output shapes
-    probs = preds.flatten() if preds.ndim > 1 else preds
-    top_idx = int(np.argmax(probs))
-    top_prob = float(np.max(probs))
-
-    st.markdown("### 🔮 Prediction")
-    st.write(f"Predicted class index: **{top_idx}** — probability: **{top_prob:.3f}**")
-
-    # Try mapping to Excel
-    mapped = map_prediction_to_row(df_cow, top_idx)
-    if mapped:
-        # find name/gender columns if present
-        name_col = next((c for c in PREFERRED_NAME_COLS if c in mapped), None)
-        id_col = next((c for c in PREFERRED_ID_COLS if c in mapped), None)
-        gender_col = next((c for c in PREFERRED_GENDER_COLS if c in mapped), None)
-
-        display_lines = []
-        if name_col:
-            display_lines.append(f"**Name:** {mapped.get(name_col)}")
-        if id_col:
-            display_lines.append(f"**ID:** {mapped.get(id_col)}")
-        if gender_col:
-            display_lines.append(f"**Gender:** {mapped.get(gender_col)}")
-
-        # other info
-        for other in OTHER_INFO_COLS:
-            if other in mapped:
-                display_lines.append(f"**{other}:** {mapped.get(other)}")
-
-        # show as success + detail table
-        st.success("🐄 Matched record from Excel")
-        for ln in display_lines:
-            st.write(ln)
-        # show full row as table
-        st.write(pd.DataFrame([mapped]))
-    else:
-        st.info("No matching record found in Excel. Showing top probabilities:")
-        topk = np.argsort(probs)[::-1][:5]
-        for i in topk:
-            st.write(f"class {int(i)} — prob {probs[int(i)]:.3f}")
-
-# Run prediction when button pressed or when image uploaded and auto-run
-if run_btn or (uploaded is not None) or (sample_choice and sample_choice != "-- none --"):
-    if image is None:
-        st.warning("Please upload or select an image first.")
-    else:
-        predict_and_display(image)
-
-# -------------------------
-# Footer / help
-# -------------------------
-st.write("---")
-st.info("Make sure MODEL_URL is set in Streamlit secrets (if you want the app to download the model). "
-        "If cow_model.h5 exists in models/ it will be used instead.")
-st.caption("If mapping doesn't show the cow name, upload a small sample of your Excel or tell me column names and I will adapt the mapping.")
+        st.warning("Model not loaded.")
+        if model_err:
+            st.code(model_err)
