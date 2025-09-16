@@ -1,6 +1,6 @@
 streamlit==1.28.0
-tensorflow-cpu==2.10.1
-numpy==1.23.5
+tensorflow-cpu==2.9.1
+numpy==1.22.4
 pandas
 openpyxl
 Pillow
