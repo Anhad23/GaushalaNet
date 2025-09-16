@@ -1,4 +1,4 @@
-# streamlit_app.py
+# streamlit_app_final.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,17 +8,21 @@ from PIL import Image, ImageOps
 import io
 import os
 import json
+import requests
 
-st.set_page_config(page_title="GaushalaNet — Local", layout="wide")
+st.set_page_config(page_title="GaushalaNet — Control", layout="wide")
 
 # ---------------- CONFIG ----------------
 DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details
-MODEL_PATH = "cow_model.h5"                   # Keras model
+MODEL_PATH = "cow_model.h5"                   # Keras model (optional; kept for fallback)
 CLASS_INDICES_PATH = "class_indices.json"     # optional mapping saved at training
 TRAIN_DIR = "cow_nose_dataset/training_data"  # optional fallback
 IMAGE_SIZE = (224, 224)                       # adjust if needed
 
-# ---------------- HELPERS ----------------
+# Prefer API URL from secrets (Streamlit Cloud) else use placeholder
+API_URL = st.secrets.get("API_URL", "https://gaushalanet-api.onrender.com/predict")
+
+# ---------------- HELPERS (data/model) ----------------
 @st.cache_data(ttl=600)
 def load_data(path=DATA_PATH):
     try:
@@ -30,6 +34,10 @@ def load_data(path=DATA_PATH):
 
 @st.cache_resource
 def try_load_model(model_path=MODEL_PATH):
+    """
+    Try to import tensorflow and load a local model.
+    Returns (model, error_message_or_None)
+    """
     try:
         import tensorflow as tf
         model = tf.keras.models.load_model(model_path)
@@ -39,13 +47,6 @@ def try_load_model(model_path=MODEL_PATH):
 
 @st.cache_data
 def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
-    """
-    Returns inv_class_indices: dict mapping index -> folder/name used in training.
-    Priority:
-      1) class_indices.json (folder_name -> idx) produced at training time
-      2) If Excel df present and 'name' column exists, use that order
-      3) Fallback to training folder names sorted()
-    """
     inv = {}
     if os.path.exists(path):
         try:
@@ -58,13 +59,13 @@ def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
 
     # Option 2: Excel order
     if df is not None and not df.empty:
-        # prefer 'name' or 'id' columns
-        if "name" in [c.lower() for c in df.columns]:
-            names = df["name"].astype(str).tolist()
+        cols_lower = [c.lower() for c in df.columns]
+        if "name" in cols_lower:
+            names = df.iloc[:, cols_lower.index("name")].astype(str).tolist()
             inv = {i: n for i, n in enumerate(names)}
             return inv, "loaded_excel_name_order"
-        if "id" in [c.lower() for c in df.columns]:
-            ids = df["id"].astype(str).tolist()
+        if "id" in cols_lower:
+            ids = df.iloc[:, cols_lower.index("id")].astype(str).tolist()
             inv = {i: n for i, n in enumerate(ids)}
             return inv, "loaded_excel_id_order"
 
@@ -89,12 +90,11 @@ def preprocess_image(image: Image.Image, target_size=IMAGE_SIZE):
     if image.mode != "RGB":
         image = image.convert("RGB")
     resample = get_resample_filter()
-    # ImageOps.fit keeps aspect ratio and crops center
     image = ImageOps.fit(image, target_size, method=resample)
     arr = np.array(image).astype(np.float32) / 255.0
     return arr
 
-def predict_index(model, pil_image: Image.Image):
+def predict_index_local(model, pil_image: Image.Image):
     x = preprocess_image(pil_image)
     x = np.expand_dims(x, axis=0)
     preds = model.predict(x)
@@ -104,6 +104,22 @@ def predict_index(model, pil_image: Image.Image):
         return idx, conf
     else:
         return None, None
+
+def predict_via_api(pil_image: Image.Image, api_url=API_URL, timeout=60):
+    """
+    Sends the image to the external API. Returns parsed JSON or raises exception.
+    The API is expected to return {"class_index": int, "confidence": float} on success.
+    """
+    buf = io.BytesIO()
+    pil_image.save(buf, format="JPEG")
+    buf.seek(0)
+    files = {"file": ("image.jpg", buf, "image/jpeg")}
+    try:
+        resp = requests.post(api_url, files=files, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise
 
 def compute_health_score(row):
     score = 80
@@ -122,7 +138,7 @@ def compute_health_score(row):
 
 # ---------------- LOAD DATA & MODEL ----------------
 df = load_data()
-# normalize column names (lowercase canonical names)
+# Normalize df column names lightly
 if not df.empty:
     cols_lower = [c.lower() for c in df.columns]
     rename_map = {}
@@ -130,7 +146,7 @@ if not df.empty:
         rename_map[df.columns[cols_lower.index("cow_id")]] = "id"
     if "cow_name" in cols_lower and "name" not in cols_lower:
         rename_map[df.columns[cols_lower.index("cow_name")]] = "name"
-    # also handle a few alternate column names if present
+    # additional alternates
     for alt in ["Name", "names", "NAME", "CowName", "cow_name"]:
         if alt in df.columns and "name" not in rename_map.values():
             rename_map[alt] = "name"
@@ -157,13 +173,12 @@ st.sidebar.write(f"Mapping source: {map_source}")
 # build labels list fallback (from df order or inv_class_indices)
 labels = None
 if inv_class_indices:
-    # create labels array ordered by index 0..n
-    max_idx = max(inv_class_indices.keys())
+    max_idx = max(inv_class_indices.keys()) if inv_class_indices else -1
     labels = [inv_class_indices.get(i, "") for i in range(max_idx + 1)]
 elif not df.empty and "name" in df.columns:
     labels = df["name"].astype(str).tolist()
 
-# ---------------- SIDEBAR ----------------
+# ---------------- SIDEBAR / NAV ----------------
 st.sidebar.title("GaushalaNet — Control")
 page = st.sidebar.radio("Navigation",
                        ["Home", "Predict (Image)", "Health Tracker", "Cow Profiles", "E-Learning", "Upload Data", "About"])
@@ -193,40 +208,78 @@ if page == "Home":
 
 elif page == "Predict (Image)":
     st.title("Identify Cow from Image")
+    st.markdown("This app prefers to call an external inference API. If that fails it will try a local model (only if available).")
+    api_available = True
+    # Show current API url (help for debugging)
+    st.info(f"Using API URL: `{API_URL}` (you can set API_URL in Streamlit Secrets)")
+
     uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
         pil_image = Image.open(io.BytesIO(uploaded_file.read()))
         st.image(pil_image, caption="Uploaded image", use_column_width=True)
-        if model is None:
-            st.error("No model loaded.")
-            if model_err:
-                st.code(model_err)
-        else:
-            if st.button("Predict"):
-                try:
-                    idx, conf = predict_index(model, pil_image)
-                    st.write(f"Raw predicted index: {idx}, confidence: {conf}")
-                    mapped_name = None
-                    # map using inv_class_indices if present
-                    if inv_class_indices and idx is not None:
-                        mapped_name = inv_class_indices.get(idx)
-                    # fallback to labels list (excel order)
-                    if mapped_name is None and labels and idx is not None and 0 <= idx < len(labels):
-                        mapped_name = labels[idx]
-                    if mapped_name:
-                        st.success(f"Predicted Cow: **{mapped_name}** ({conf * 100:.2f}% confidence)")
-                        # show profile if available
-                        profile = pd.DataFrame()
-                        if "name" in df.columns:
-                            profile = df[df["name"].astype(str).str.strip().str.lower() == mapped_name.strip().lower()]
+
+        # Try API call first
+        with st.spinner("Sending image to inference API..."):
+            api_result = None
+            api_error = None
+            try:
+                api_result = predict_via_api(pil_image, api_url=API_URL, timeout=60)
+            except Exception as e:
+                api_error = str(e)
+
+        if api_result is not None:
+            # Expected API response: {"class_index": int, "confidence": float}
+            if "error" in api_result:
+                st.error(f"API returned error: {api_result['error']}")
+            else:
+                idx = api_result.get("class_index")
+                conf = api_result.get("confidence")
+                st.success(f"API predicted index: {idx}, confidence: {conf}")
+                mapped_name = None
+                if inv_class_indices and idx is not None:
+                    mapped_name = inv_class_indices.get(int(idx))
+                if mapped_name is None and labels and idx is not None and 0 <= int(idx) < len(labels):
+                    mapped_name = labels[int(idx)]
+                if mapped_name:
+                    st.success(f"Predicted Cow: **{mapped_name}** ({conf * 100:.2f}% confidence)")
+                    if not df.empty and "name" in df.columns:
+                        profile = df[df["name"].astype(str).str.strip().str.lower() == mapped_name.strip().lower()]
                         if not profile.empty:
                             st.subheader("Cow Profile")
                             st.table(profile.head(1).T)
-                    else:
-                        st.warning("Could not map prediction to a cow name. Check mapping source or provide class_indices.json.")
-                        st.info(f"Mapping source: {map_source}, inv_class_indices entries: {list(inv_class_indices.items())[:10]}")
-                except Exception as e:
-                    st.error(f"Prediction failed: {e}")
+                else:
+                    st.warning("API prediction couldn't be mapped to a cow name.")
+        else:
+            st.warning("API request failed; falling back to local model if available.")
+            if api_error:
+                st.code(f"API error: {api_error}")
+
+            # Local fallback
+            if model is None:
+                st.error("No local model available for fallback.")
+                if model_err:
+                    st.code(model_err)
+            else:
+                if st.button("Predict with local model"):
+                    try:
+                        idx, conf = predict_index_local(model, pil_image)
+                        st.write(f"Raw predicted index: {idx}, confidence: {conf}")
+                        mapped_name = None
+                        if inv_class_indices and idx is not None:
+                            mapped_name = inv_class_indices.get(idx)
+                        if mapped_name is None and labels and idx is not None and 0 <= idx < len(labels):
+                            mapped_name = labels[idx]
+                        if mapped_name:
+                            st.success(f"Predicted Cow: **{mapped_name}** ({conf * 100:.2f}% confidence)")
+                            if not df.empty and "name" in df.columns:
+                                profile = df[df["name"].astype(str).str.strip().str.lower() == mapped_name.strip().lower()]
+                                if not profile.empty:
+                                    st.subheader("Cow Profile")
+                                    st.table(profile.head(1).T)
+                        else:
+                            st.warning("Could not map local prediction to a cow name.")
+                    except Exception as e:
+                        st.error(f"Local prediction failed: {e}")
 
 elif page == "Health Tracker":
     st.title("Health Tracker — Alerts & Management")
@@ -287,13 +340,16 @@ elif page == "Upload Data":
         new_df = pd.read_excel(uploaded)
         st.dataframe(new_df.head())
         if st.button("Save uploaded dataset"):
-            new_df.to_excel(DATA_PATH, index=False)
-            st.success("Saved dataset. Restart app to load new data.")
+            try:
+                new_df.to_excel(DATA_PATH, index=False)
+                st.success("Saved dataset. Restart app to load new data.")
+            except Exception as e:
+                st.error(f"Failed to save file: {e}")
 
 else:
     st.title("About")
-    st.write("GaushalaNet — Local-only demo")
+    st.write("GaushalaNet — Demo (UI calls remote inference API)")
     if model is None:
-        st.warning("Model not loaded.")
+        st.warning("Local model not loaded; app uses remote API for inference.")
         if model_err:
             st.code(model_err)
