@@ -14,7 +14,7 @@ import requests
 st.set_page_config(page_title="GaushalaNet — Local", layout="wide")
 
 # ---------------- CONFIG ----------------
-DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details (matches your uploaded file)
+DATA_PATH = "Facila Recongnition Data.xlsx"   # Excel with cow details (you said column is 'Names')
 MODEL_PATH = "cow_model.h5"                   # Local fallback model
 CLASS_INDICES_PATH = "class_indices.json"     # optional mapping saved at training
 TRAIN_DIR = "cow_nose_dataset/training_data"  # optional fallback
@@ -25,6 +25,8 @@ IMAGE_SIZE = (224, 224)                       # adjust if needed
 def load_data(path=DATA_PATH):
     try:
         df = pd.read_excel(path)
+        # ensure deterministic order
+        df = df.reset_index(drop=True)
         return df
     except Exception as e:
         st.warning(f"Could not read Excel file at {path}: {e}")
@@ -69,7 +71,7 @@ def download_model_from_gdrive(url_or_id: str, out_path: str, chunk_size: int = 
 @st.cache_resource
 def try_load_model(model_path=MODEL_PATH):
     import tensorflow as tf
-    # If MODEL_URL secret exists, prefer that
+    # If MODEL_URL secret exists, prefer that (and download to model_path)
     MODEL_URL = st.secrets.get("MODEL_URL", None) if "MODEL_URL" in st.secrets else None
     if MODEL_URL and not os.path.exists(model_path):
         try:
@@ -90,7 +92,7 @@ def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
     Returns inv_class_indices: dict mapping index -> folder/name used in training.
     Priority:
       1) class_indices.json
-      2) Excel df with 'name' or 'id' column
+      2) Excel df with 'Names' or 'name' column
       3) Training folder names
     """
     inv = {}
@@ -104,12 +106,18 @@ def load_class_indices(path=CLASS_INDICES_PATH, train_dir=TRAIN_DIR, df=None):
             return {}, f"failed_json:{e}"
 
     if df is not None and not df.empty:
-        # prefer 'name' or 'id' columns (case-insensitive)
         cols_lower = [c.lower() for c in df.columns]
+        # Prefer exact 'Names' column (per your sheet)
+        if "names" in cols_lower:
+            names = df[df.columns[cols_lower.index("names")]].astype(str).tolist()
+            inv = {i: n for i, n in enumerate(names)}
+            return inv, "loaded_excel_Names_order"
+        # fallback to case-insensitive 'name'
         if "name" in cols_lower:
             names = df[df.columns[cols_lower.index("name")]].astype(str).tolist()
             inv = {i: n for i, n in enumerate(names)}
             return inv, "loaded_excel_name_order"
+        # fallback to 'id' column if present
         if "id" in cols_lower:
             ids = df[df.columns[cols_lower.index("id")]].astype(str).tolist()
             inv = {i: n for i, n in enumerate(ids)}
@@ -167,20 +175,10 @@ def compute_health_score(row):
 
 # ---------------- LOAD DATA & MODEL ----------------
 df = load_data()
+# preserve original columns; we will read 'Names' directly when mapping
 if not df.empty:
+    # convert date-like columns, compute age/health_score (same logic as before)
     cols_lower = [c.lower() for c in df.columns]
-    rename_map = {}
-    if "cow_id" in cols_lower and "id" not in cols_lower:
-        rename_map[df.columns[cols_lower.index("cow_id")]] = "id"
-    if "cow_name" in cols_lower and "name" not in cols_lower:
-        rename_map[df.columns[cols_lower.index("cow_name")]] = "name"
-    for alt in ["Name", "names", "NAME", "CowName", "cow_name"]:
-        if alt in df.columns and "name" not in rename_map.values():
-            rename_map[alt] = "name"
-            break
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
     for c in df.columns:
         if any(x in c.lower() for x in ["date", "dob", "checkup", "vacc"]):
             try:
@@ -196,12 +194,15 @@ model, model_err = try_load_model(MODEL_PATH)
 inv_class_indices, map_source = load_class_indices(CLASS_INDICES_PATH, TRAIN_DIR, df)
 st.sidebar.write(f"Mapping source: {map_source}")
 
+# Build labels fallback: try inv_class_indices, else Excel 'Names' column order
 labels = None
 if inv_class_indices:
     max_idx = max(inv_class_indices.keys())
     labels = [inv_class_indices.get(i, "") for i in range(max_idx + 1)]
-elif not df.empty and "name" in df.columns:
-    labels = df["name"].astype(str).tolist()
+elif not df.empty and any(c.lower() == "names" for c in df.columns):
+    # use 'Names' column ordered list
+    names_col = [c for c in df.columns if c.lower() == "names"][0]
+    labels = df[names_col].astype(str).tolist()
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.title("GaushalaNet — Control")
@@ -245,16 +246,22 @@ elif page == "Predict (Image)":
             if st.button("Predict"):
                 try:
                     idx, conf = predict_index(model, pil_image)
-                    # Map index -> name using Excel order (row order)
-                    if idx is not None and not df.empty and "name" in df.columns:
-                        if 0 <= idx < len(df):
-                            cow_name = str(df.iloc[idx]["name"])
-                            # Show only the name as requested
+                    # Map index -> cow name using 'Names' column directly (row order)
+                    if idx is not None:
+                        # prefer class_indices mapping if available
+                        if inv_class_indices and idx in inv_class_indices:
+                            cow_name = inv_class_indices[idx]
                             st.success(f"🐄 Predicted Cow: **{cow_name}**")
                         else:
-                            st.error("Prediction index out of range for dataset.")
+                            # use Excel 'Names' column if present
+                            names_cols = [c for c in df.columns if c.lower() == "names"]
+                            if names_cols and 0 <= idx < len(df):
+                                cow_name = str(df.iloc[idx][names_cols[0]])
+                                st.success(f"🐄 Predicted Cow: **{cow_name}**")
+                            else:
+                                st.error("Could not map prediction to a cow name — ensure Excel has a 'Names' column and matches training order.")
                     else:
-                        st.error("Could not map prediction to a cow name — ensure the Excel has a 'name' column and matches training order.")
+                        st.error("Model did not return a valid class index.")
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
 
@@ -270,13 +277,15 @@ elif page == "Health Tracker":
             due = df[(vacc_dates - today).dt.days.between(0, 30)]
             if not due.empty:
                 st.warning(f"{len(due)} animals have vaccination due soon")
-                st.dataframe(due[["id", "name", "breed", "vaccination_due"]])
+                st.dataframe(due[["id", "Names", "breed", "vaccination_due"]].head(50))
             else:
                 st.success("No vaccinations due in next 30 days.")
         st.markdown("#### Low health score animals (score < 50)")
         low = df[df["health_score"] < 50] if "health_score" in df.columns else pd.DataFrame()
         if not low.empty:
-            st.dataframe(low[["id", "name", "breed", "age", "health_score", "health_status"]].head(50))
+            # try to display id/Names/breed/age/health_score columns if present
+            cols_to_show = [c for c in ["id", "Names", "breed", "age", "health_score", "health_status"] if c in df.columns]
+            st.dataframe(low[cols_to_show].head(50))
         else:
             st.success("No animals below health threshold.")
 
